@@ -36,7 +36,7 @@ function startTraining() {
   }
 
   questions = [];
-  for (let i = 1; i <= 2; i++) {
+  for (let i = 1; i <= 10; i++) {
     questions.push({ a: table, b: i, answer: table * i });
   }
 
