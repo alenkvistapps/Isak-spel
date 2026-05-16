@@ -1,0 +1,1044 @@
+<!DOCTYPE html>
+<html lang="sv">
+<head>
+<meta charset="UTF-8">
+<title>ISAKs GeoDash</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { background: #111; display: flex; flex-direction: column; align-items: center; justify-content: center; height: 100vh; font-family: 'Segoe UI', sans-serif; color: #fff; overflow: hidden; }
+  canvas { border: 2px solid #333; display: block; }
+  #ui { position: absolute; top: 0; left: 0; width: 100%; height: 100%; pointer-events: none; }
+  #overlay { position: absolute; top: 0; left: 0; width: 100%; height: 100%; display: flex; flex-direction: column; align-items: center; justify-content: center; background: rgba(0,0,0,0.75); }
+  #overlay h1 { font-size: 3rem; color: #f5a623; text-shadow: 0 0 20px #f5a623; margin-bottom: 0.5rem; letter-spacing: 4px; }
+  #overlay p { color: #aaa; margin: 0.3rem 0; font-size: 1rem; }
+  #overlay .subtitle { font-size: 1.4rem; color: #fff; margin-bottom: 1.5rem; }
+  #overlay button { margin-top: 1.5rem; padding: 0.8rem 2.5rem; font-size: 1.1rem; border: none; border-radius: 8px; background: #f5a623; color: #111; font-weight: bold; cursor: pointer; letter-spacing: 2px; transition: background 0.2s; pointer-events: all; }
+  #overlay button:hover { background: #ffcc55; }
+  #level-select { display: flex; flex-wrap: wrap; justify-content: center; gap: 0.6rem; margin: 1rem 0; max-width: 600px; }
+  #level-select button { padding: 0.6rem 1.4rem; font-size: 1rem; border: 2px solid #f5a623; border-radius: 8px; background: transparent; color: #f5a623; cursor: pointer; transition: all 0.2s; pointer-events: all; }
+  #level-select button:hover, #level-select button.active { background: #f5a623; color: #111; }
+  #hud { position: absolute; top: 10px; left: 50%; transform: translateX(-50%); display: flex; gap: 2rem; font-size: 1rem; color: #fff; }
+  #progress-bar-wrap { position: absolute; top: 8px; left: 10%; width: 80%; height: 8px; background: #333; border-radius: 4px; }
+  #progress-bar { height: 100%; width: 0%; background: #f5a623; border-radius: 4px; transition: width 0.1s; }
+  #percent { position: absolute; top: 20px; left: 50%; transform: translateX(-50%); font-size: 0.85rem; color: #aaa; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div id="ui">
+  <div id="progress-bar-wrap"><div id="progress-bar"></div></div>
+  <div id="percent">0%</div>
+  <div id="overlay">
+    <h1>ISAKs GEODASH</h1>
+    <div class="subtitle">Välj nivå</div>
+    <div id="level-select">
+      <button class="active" data-level="0">Nivå 1</button>
+      <button data-level="1">Nivå 2</button>
+      <button data-level="2">Nivå 3</button>
+      <button data-level="3">Nivå 4</button>
+      <button data-level="4">Nivå 5</button>
+      <button data-level="5">Nivå 6</button>
+      <button data-level="6">Nivå 7</button>
+      <button data-level="7">Nivå 8</button>
+      <button data-level="8">Nivå 9</button>
+      <button data-level="9">✈ Flygläge 1</button>
+    </div>
+    <p>Håll <strong>SPACE</strong> för att hoppa</p>
+    <p style="font-size:0.8rem;color:#666;margin-top:0.5rem;">Hoppa flera gånger medan du håller in space</p>
+    <button id="startBtn">STARTA</button>
+  </div>
+</div>
+<script>
+const canvas = document.getElementById('c');
+const ctx = canvas.getContext('2d');
+const W = 900, H = 500;
+canvas.width = W; canvas.height = H;
+
+const overlay = document.getElementById('overlay');
+const progressBar = document.getElementById('progress-bar');
+const percentEl = document.getElementById('percent');
+
+// ── Audio ──────────────────────────────────────────────────────────────
+const AC = new (window.AudioContext || window.webkitAudioContext)();
+function playTone(freq, type, dur, vol = 0.15) {
+  const o = AC.createOscillator(), g = AC.createGain();
+  o.connect(g); g.connect(AC.destination);
+  o.type = type; o.frequency.value = freq;
+  g.gain.setValueAtTime(vol, AC.currentTime);
+  g.gain.exponentialRampToValueAtTime(0.001, AC.currentTime + dur);
+  o.start(); o.stop(AC.currentTime + dur);
+}
+function sfxJump()   { playTone(520, 'square', 0.12, 0.1); }
+function sfxDeath()  { playTone(120, 'sawtooth', 0.4, 0.2); playTone(80, 'sawtooth', 0.6, 0.15); }
+function sfxWin()    { [523,659,784,1047].forEach((f,i) => setTimeout(() => playTone(f,'sine',0.3,0.15), i*120)); }
+function sfxPortal() { [400,600,900].forEach((f,i) => setTimeout(() => playTone(f,'sine',0.2,0.12), i*80)); }
+
+// ── Constants ──────────────────────────────────────────────────────────
+const GROUND = H - 60;
+const TILE = 40;
+const GRAVITY = 0.7;
+const JUMP_FORCE = -13.5;
+const SPEED = 6;
+const JUMP_INTERVAL = 280;
+const GRAVITY_PLANE = 0.28;
+const THRUST = 0.55;
+const MAX_VY_PLANE = 7;
+
+// ── Level definitions ──────────────────────────────────────────────────
+// Each level: { bg, ground color, objects: [{type, x, y, w, h, dy?}] }
+// x is world-space pixels from start
+// Types: 'spike' (ground), 'cspike' (ceiling), 'platform', 'mover' (moving block)
+function planeSection(startX, count, gap, hard) {
+  const obs = [];
+  let x = startX;
+  for (let i = 0; i < count; i++) {
+    const r = Math.random();
+    if (hard && r < 0.35) {
+      obs.push({type:'spike', x}, {type:'cspike', x});
+    } else if (r < 0.45) {
+      obs.push({type:'spike', x});
+    } else if (r < 0.9) {
+      obs.push({type:'cspike', x});
+    } else {
+      obs.push({type:'spike', x}, {type:'cspike', x});
+    }
+    x += gap + Math.floor(Math.random() * 80);
+  }
+  return obs;
+}
+
+function makeLevels() {
+  return [
+    // LEVEL 1 — easy
+    {
+      length: 8800,
+      bgTop: '#1a1a2e', bgBot: '#16213e', groundColor: '#4a90d9',
+      objects: [
+        {type:'spike', x:500},
+        {type:'spike', x:700},
+        {type:'spike', x:910}, {type:'spike', x:950},
+        {type:'cspike', x:1150},
+        {type:'platform', x:1370, y:GROUND-120, w:160, h:16},
+        {type:'spike', x:1640},
+        {type:'spike', x:1830}, {type:'spike', x:1870},
+        {type:'cspike', x:2070},
+        {type:'spike', x:2270},
+        {type:'spike', x:2460}, {type:'spike', x:2500},
+        {type:'platform', x:2720, y:GROUND-110, w:140, h:16},
+        {type:'spike', x:2990},
+        {type:'spike', x:3180}, {type:'spike', x:3220},
+        {type:'cspike', x:3420},
+        {type:'spike', x:3620},
+        {type:'spike', x:3810}, {type:'spike', x:3850},
+        {type:'cspike', x:4050},
+        {type:'spike', x:4250},
+        {type:'spike', x:4450}, {type:'spike', x:4490},
+        {type:'spike', x:4680},
+        {type:'spike', x:4870}, {type:'spike', x:4910},
+        {type:'portal', x:5300, toMode:'plane'},
+        ...planeSection(5600, 12, 260, false),
+      ]
+    },
+    // LEVEL 2 — medium
+    {
+      length: 10500,
+      bgTop: '#0d1b2a', bgBot: '#1b263b', groundColor: '#e76f51',
+      objects: [
+        {type:'spike', x:500}, {type:'spike', x:540},
+        {type:'mover', x:740, y:GROUND-200, w:30, h:30, dy:2},
+        {type:'spike', x:760},
+        {type:'spike', x:910}, {type:'spike', x:950},
+        {type:'cspike', x:1090},
+        {type:'platform', x:1270, y:GROUND-140, w:120, h:16},
+        {type:'spike', x:1500},
+        {type:'spike', x:1650}, {type:'spike', x:1690},
+        {type:'mover', x:1880, y:GROUND-190, w:28, h:28, dy:3},
+        {type:'cspike', x:1900},
+        {type:'spike', x:2060},
+        {type:'spike', x:2210}, {type:'spike', x:2250},
+        {type:'cspike', x:2410},
+        {type:'spike', x:2570},
+        {type:'mover', x:2760, y:GROUND-220, w:32, h:32, dy:2.5},
+        {type:'spike', x:2760}, {type:'spike', x:2800},
+        {type:'platform', x:2990, y:GROUND-130, w:110, h:16},
+        {type:'spike', x:3220},
+        {type:'spike', x:3370}, {type:'spike', x:3410},
+        {type:'cspike', x:3570},
+        {type:'mover', x:3760, y:GROUND-210, w:30, h:30, dy:3},
+        {type:'spike', x:3780},
+        {type:'spike', x:3930}, {type:'spike', x:3970},
+        {type:'cspike', x:4130},
+        {type:'spike', x:4290},
+        {type:'mover', x:4480, y:GROUND-200, w:28, h:28, dy:3.5},
+        {type:'spike', x:4500}, {type:'spike', x:4540},
+        {type:'spike', x:4700},
+        {type:'spike', x:4860}, {type:'spike', x:4900},
+        {type:'cspike', x:5060},
+        {type:'spike', x:5220},
+        {type:'spike', x:5380}, {type:'spike', x:5420},
+        {type:'mover', x:5610, y:GROUND-200, w:28, h:28, dy:3},
+        {type:'cspike', x:5630},
+        {type:'spike', x:5790},
+        {type:'spike', x:5950}, {type:'spike', x:5990},
+        {type:'spike', x:6170},
+        {type:'spike', x:6330}, {type:'spike', x:6370},
+        {type:'portal', x:6700, toMode:'plane'},
+        ...planeSection(7000, 12, 230, false),
+      ]
+    },
+    // LEVEL 3 — hard
+    {
+      length: 11500,
+      bgTop: '#10002b', bgBot: '#240046', groundColor: '#9b5de5',
+      objects: [
+        {type:'spike', x:400}, {type:'spike', x:440},
+        {type:'spike', x:650},
+        {type:'mover', x:850, y:GROUND-220, w:32, h:32, dy:4},
+        {type:'spike', x:880}, {type:'spike', x:920},
+        {type:'cspike', x:1130},
+        {type:'spike', x:1350},
+        {type:'mover', x:1560, y:GROUND-230, w:30, h:30, dy:5},
+        {type:'spike', x:1580}, {type:'spike', x:1620},
+        {type:'cspike', x:1840},
+        {type:'spike', x:2060},
+        {type:'platform', x:2280, y:GROUND-150, w:90, h:16},
+        {type:'spike', x:2500}, {type:'spike', x:2540},
+        {type:'mover', x:2750, y:GROUND-230, w:30, h:30, dy:5},
+        {type:'cspike', x:2780},
+        {type:'spike', x:3000},
+        {type:'spike', x:3200}, {type:'spike', x:3240},
+        {type:'cspike', x:3460},
+        {type:'mover', x:3680, y:GROUND-210, w:32, h:32, dy:4},
+        {type:'spike', x:3710},
+        {type:'spike', x:3920}, {type:'spike', x:3960},
+        {type:'platform', x:4180, y:GROUND-140, w:80, h:16},
+        {type:'spike', x:4400}, {type:'spike', x:4440},
+        {type:'cspike', x:4660},
+        {type:'mover', x:4880, y:GROUND-220, w:28, h:28, dy:5},
+        {type:'spike', x:4920},
+        {type:'spike', x:5130}, {type:'spike', x:5170},
+        {type:'cspike', x:5390},
+        {type:'mover', x:5610, y:GROUND-230, w:30, h:30, dy:4.5},
+        {type:'spike', x:5650},
+        {type:'spike', x:5860}, {type:'spike', x:5900},
+        {type:'cspike', x:6120},
+        {type:'mover', x:6340, y:GROUND-210, w:28, h:28, dy:5},
+        {type:'spike', x:6380},
+        {type:'platform', x:6600, y:GROUND-140, w:80, h:16},
+        {type:'spike', x:6830}, {type:'spike', x:6870},
+        {type:'cspike', x:7090},
+        {type:'spike', x:7310},
+        {type:'spike', x:7520}, {type:'spike', x:7560},
+        {type:'portal', x:7900, toMode:'plane'},
+        ...planeSection(8200, 14, 210, true),
+      ]
+    },
+    // LEVEL 4 — medium-hard (green)
+    {
+      length: 10500,
+      bgTop: '#0d2818', bgBot: '#1a472a', groundColor: '#40916c',
+      objects: [
+        {type:'spike', x:500},
+        {type:'spike', x:700}, {type:'spike', x:740},
+        {type:'cspike', x:950},
+        {type:'mover', x:1150, y:GROUND-200, w:30, h:30, dy:2.5},
+        {type:'spike', x:1200}, {type:'spike', x:1240},
+        {type:'spike', x:1430},
+        {type:'cspike', x:1620},
+        {type:'spike', x:1820}, {type:'spike', x:1860},
+        {type:'platform', x:2060, y:GROUND-130, w:130, h:16},
+        {type:'spike', x:2310},
+        {type:'mover', x:2510, y:GROUND-205, w:28, h:28, dy:3},
+        {type:'spike', x:2560}, {type:'spike', x:2600},
+        {type:'cspike', x:2800},
+        {type:'spike', x:3000},
+        {type:'spike', x:3190}, {type:'spike', x:3230},
+        {type:'mover', x:3430, y:GROUND-210, w:30, h:30, dy:2.5},
+        {type:'cspike', x:3460},
+        {type:'spike', x:3670},
+        {type:'spike', x:3860}, {type:'spike', x:3900},
+        {type:'platform', x:4100, y:GROUND-120, w:120, h:16},
+        {type:'cspike', x:4340},
+        {type:'spike', x:4540}, {type:'spike', x:4580},
+        {type:'mover', x:4780, y:GROUND-200, w:28, h:28, dy:3},
+        {type:'spike', x:4820},
+        {type:'spike', x:5010}, {type:'spike', x:5050},
+        {type:'cspike', x:5250},
+        {type:'spike', x:5450},
+        {type:'spike', x:5640}, {type:'spike', x:5680},
+        {type:'cspike', x:5880},
+        {type:'spike', x:6080}, {type:'spike', x:6120},
+        {type:'spike', x:6340},
+        {type:'spike', x:6530}, {type:'spike', x:6570},
+        {type:'portal', x:7000, toMode:'plane'},
+        ...planeSection(7300, 13, 210, true),
+      ]
+    },
+    // LEVEL 5 — hard (crimson)
+    {
+      length: 10500,
+      bgTop: '#2d0000', bgBot: '#5c1010', groundColor: '#e63946',
+      objects: [
+        {type:'spike', x:450}, {type:'spike', x:490},
+        {type:'cspike', x:680},
+        {type:'spike', x:870},
+        {type:'mover', x:1050, y:GROUND-210, w:30, h:30, dy:3},
+        {type:'spike', x:1080}, {type:'spike', x:1120},
+        {type:'cspike', x:1300},
+        {type:'spike', x:1480}, {type:'spike', x:1520},
+        {type:'spike', x:1700},
+        {type:'mover', x:1890, y:GROUND-220, w:32, h:32, dy:3.5},
+        {type:'cspike', x:1920},
+        {type:'spike', x:2110}, {type:'spike', x:2150},
+        {type:'platform', x:2360, y:GROUND-135, w:110, h:16},
+        {type:'spike', x:2590},
+        {type:'spike', x:2770}, {type:'spike', x:2810},
+        {type:'mover', x:3000, y:GROUND-215, w:30, h:30, dy:3},
+        {type:'cspike', x:3030},
+        {type:'spike', x:3220},
+        {type:'spike', x:3400}, {type:'spike', x:3440},
+        {type:'cspike', x:3630},
+        {type:'spike', x:3820}, {type:'spike', x:3860},
+        {type:'mover', x:4060, y:GROUND-210, w:28, h:28, dy:3.5},
+        {type:'spike', x:4100},
+        {type:'spike', x:4290}, {type:'spike', x:4330},
+        {type:'cspike', x:4520},
+        {type:'platform', x:4720, y:GROUND-130, w:100, h:16},
+        {type:'spike', x:4950}, {type:'spike', x:4990},
+        {type:'mover', x:5180, y:GROUND-220, w:30, h:30, dy:3},
+        {type:'cspike', x:5210},
+        {type:'spike', x:5400},
+        {type:'spike', x:5580}, {type:'spike', x:5620},
+        {type:'cspike', x:5810},
+        {type:'spike', x:6000}, {type:'spike', x:6040},
+        {type:'spike', x:6250},
+        {type:'spike', x:6430}, {type:'spike', x:6470},
+        {type:'portal', x:6700, toMode:'plane'},
+        ...planeSection(7000, 13, 190, true),
+      ]
+    },
+    // LEVEL 6 — harder (gold)
+    {
+      length: 10200,
+      bgTop: '#1a1400', bgBot: '#3d3000', groundColor: '#f4a261',
+      objects: [
+        {type:'spike', x:420}, {type:'spike', x:460},
+        {type:'cspike', x:630},
+        {type:'spike', x:800}, {type:'spike', x:840},
+        {type:'mover', x:1010, y:GROUND-215, w:30, h:30, dy:3.5},
+        {type:'spike', x:1040},
+        {type:'cspike', x:1200},
+        {type:'spike', x:1360}, {type:'spike', x:1400},
+        {type:'spike', x:1560},
+        {type:'mover', x:1730, y:GROUND-220, w:32, h:32, dy:4},
+        {type:'spike', x:1760}, {type:'spike', x:1800},
+        {type:'cspike', x:1970},
+        {type:'spike', x:2130},
+        {type:'spike', x:2290}, {type:'spike', x:2330},
+        {type:'platform', x:2510, y:GROUND-140, w:100, h:16},
+        {type:'mover', x:2740, y:GROUND-220, w:30, h:30, dy:3.5},
+        {type:'spike', x:2770},
+        {type:'spike', x:2940}, {type:'spike', x:2980},
+        {type:'cspike', x:3150},
+        {type:'spike', x:3310},
+        {type:'spike', x:3470}, {type:'spike', x:3510},
+        {type:'mover', x:3690, y:GROUND-215, w:28, h:28, dy:4},
+        {type:'cspike', x:3720},
+        {type:'spike', x:3900}, {type:'spike', x:3940},
+        {type:'spike', x:4110},
+        {type:'cspike', x:4280},
+        {type:'spike', x:4440}, {type:'spike', x:4480},
+        {type:'mover', x:4660, y:GROUND-225, w:30, h:30, dy:4},
+        {type:'platform', x:4700, y:GROUND-135, w:90, h:16},
+        {type:'spike', x:4930}, {type:'spike', x:4970},
+        {type:'cspike', x:5140},
+        {type:'spike', x:5300},
+        {type:'spike', x:5460}, {type:'spike', x:5500},
+        {type:'mover', x:5680, y:GROUND-220, w:30, h:30, dy:4},
+        {type:'cspike', x:5710},
+        {type:'spike', x:5890}, {type:'spike', x:5930},
+        {type:'spike', x:6110},
+        {type:'spike', x:6280}, {type:'spike', x:6320},
+        {type:'spike', x:6490},
+        {type:'portal', x:6800, toMode:'plane'},
+        ...planeSection(7100, 14, 180, true),
+      ]
+    },
+    // LEVEL 7 — very hard (cyan)
+    {
+      length: 11000,
+      bgTop: '#001a1a', bgBot: '#003333', groundColor: '#00b4d8',
+      objects: [
+        {type:'spike', x:400}, {type:'spike', x:440},
+        {type:'mover', x:600, y:GROUND-220, w:30, h:30, dy:4.5},
+        {type:'cspike', x:610},
+        {type:'spike', x:770}, {type:'spike', x:810},
+        {type:'spike', x:980},
+        {type:'mover', x:1140, y:GROUND-225, w:28, h:28, dy:5},
+        {type:'spike', x:1150}, {type:'spike', x:1190},
+        {type:'cspike', x:1360},
+        {type:'spike', x:1510},
+        {type:'spike', x:1670}, {type:'spike', x:1710},
+        {type:'platform', x:1890, y:GROUND-145, w:85, h:16},
+        {type:'spike', x:2090}, {type:'spike', x:2130},
+        {type:'mover', x:2310, y:GROUND-220, w:30, h:30, dy:4.5},
+        {type:'cspike', x:2330},
+        {type:'spike', x:2510},
+        {type:'spike', x:2670}, {type:'spike', x:2710},
+        {type:'cspike', x:2890},
+        {type:'mover', x:3060, y:GROUND-225, w:28, h:28, dy:5},
+        {type:'spike', x:3090},
+        {type:'spike', x:3250}, {type:'spike', x:3290},
+        {type:'cspike', x:3460},
+        {type:'spike', x:3610},
+        {type:'mover', x:3780, y:GROUND-220, w:30, h:30, dy:4.5},
+        {type:'spike', x:3800}, {type:'spike', x:3840},
+        {type:'platform', x:4020, y:GROUND-140, w:80, h:16},
+        {type:'spike', x:4230}, {type:'spike', x:4270},
+        {type:'cspike', x:4450},
+        {type:'mover', x:4620, y:GROUND-225, w:28, h:28, dy:5},
+        {type:'spike', x:4660},
+        {type:'spike', x:4820}, {type:'spike', x:4860},
+        {type:'cspike', x:5040},
+        {type:'spike', x:5210},
+        {type:'mover', x:5380, y:GROUND-220, w:30, h:30, dy:4.5},
+        {type:'spike', x:5410}, {type:'spike', x:5450},
+        {type:'spike', x:5640},
+        {type:'spike', x:5810}, {type:'spike', x:5850},
+        {type:'platform', x:6040, y:GROUND-140, w:80, h:16},
+        {type:'mover', x:6240, y:GROUND-220, w:28, h:28, dy:5},
+        {type:'spike', x:6280}, {type:'spike', x:6320},
+        {type:'cspike', x:6510},
+        {type:'spike', x:6680},
+        {type:'spike', x:6840}, {type:'spike', x:6880},
+        {type:'portal', x:7200, toMode:'plane'},
+        ...planeSection(7500, 15, 165, true),
+      ]
+    },
+    // LEVEL 8 — very hard+ (magenta)
+    {
+      length: 11000,
+      bgTop: '#1a001a', bgBot: '#330033', groundColor: '#c77dff',
+      objects: [
+        {type:'spike', x:380}, {type:'spike', x:420},
+        {type:'mover', x:560, y:GROUND-225, w:30, h:30, dy:5},
+        {type:'cspike', x:570},
+        {type:'spike', x:720},
+        {type:'spike', x:860}, {type:'spike', x:900},
+        {type:'mover', x:1050, y:GROUND-220, w:28, h:28, dy:5},
+        {type:'cspike', x:1060},
+        {type:'spike', x:1210},
+        {type:'spike', x:1360}, {type:'spike', x:1400},
+        {type:'mover', x:1560, y:GROUND-225, w:30, h:30, dy:5},
+        {type:'cspike', x:1570},
+        {type:'spike', x:1720},
+        {type:'platform', x:1870, y:GROUND-140, w:80, h:16},
+        {type:'spike', x:2080}, {type:'spike', x:2120},
+        {type:'mover', x:2280, y:GROUND-220, w:28, h:28, dy:5},
+        {type:'cspike', x:2290},
+        {type:'spike', x:2450},
+        {type:'spike', x:2600}, {type:'spike', x:2640},
+        {type:'mover', x:2800, y:GROUND-225, w:30, h:30, dy:5},
+        {type:'cspike', x:2820},
+        {type:'spike', x:2980},
+        {type:'spike', x:3130}, {type:'spike', x:3170},
+        {type:'platform', x:3330, y:GROUND-140, w:80, h:16},
+        {type:'mover', x:3530, y:GROUND-220, w:28, h:28, dy:5},
+        {type:'spike', x:3560}, {type:'spike', x:3600},
+        {type:'cspike', x:3760},
+        {type:'spike', x:3910},
+        {type:'spike', x:4060}, {type:'spike', x:4100},
+        {type:'mover', x:4260, y:GROUND-225, w:30, h:30, dy:5},
+        {type:'cspike', x:4280},
+        {type:'spike', x:4440},
+        {type:'spike', x:4590}, {type:'spike', x:4630},
+        {type:'mover', x:4800, y:GROUND-220, w:28, h:28, dy:5},
+        {type:'cspike', x:4820},
+        {type:'spike', x:4980},
+        {type:'spike', x:5130}, {type:'spike', x:5170},
+        {type:'platform', x:5340, y:GROUND-140, w:80, h:16},
+        {type:'spike', x:5560}, {type:'spike', x:5600},
+        {type:'mover', x:5770, y:GROUND-225, w:30, h:30, dy:5},
+        {type:'cspike', x:5790},
+        {type:'spike', x:5960},
+        {type:'spike', x:6110}, {type:'spike', x:6150},
+        {type:'cspike', x:6320},
+        {type:'spike', x:6490},
+        {type:'spike', x:6630}, {type:'spike', x:6670},
+        {type:'portal', x:7000, toMode:'plane'},
+        ...planeSection(7300, 15, 150, true),
+      ]
+    },
+    // LEVEL 9 — extreme (fire)
+    {
+      length: 11000,
+      bgTop: '#1a0500', bgBot: '#3d0f00', groundColor: '#ff6b35',
+      objects: [
+        {type:'spike', x:500}, {type:'spike', x:540},
+        {type:'mover', x:730, y:GROUND-225, w:30, h:30, dy:4.5},
+        {type:'cspike', x:750},
+        {type:'spike', x:950},
+        {type:'spike', x:1160}, {type:'spike', x:1200},
+        {type:'mover', x:1410, y:GROUND-220, w:28, h:28, dy:4.5},
+        {type:'cspike', x:1430},
+        {type:'spike', x:1640},
+        {type:'platform', x:1870, y:GROUND-140, w:90, h:16},
+        {type:'spike', x:2110}, {type:'spike', x:2150},
+        {type:'mover', x:2380, y:GROUND-225, w:30, h:30, dy:4.5},
+        {type:'cspike', x:2400},
+        {type:'spike', x:2620},
+        {type:'spike', x:2830}, {type:'spike', x:2870},
+        {type:'cspike', x:3090},
+        {type:'mover', x:3310, y:GROUND-220, w:28, h:28, dy:4.5},
+        {type:'spike', x:3350},
+        {type:'spike', x:3560}, {type:'spike', x:3600},
+        {type:'platform', x:3820, y:GROUND-140, w:90, h:16},
+        {type:'cspike', x:4060},
+        {type:'spike', x:4280}, {type:'spike', x:4320},
+        {type:'mover', x:4550, y:GROUND-225, w:30, h:30, dy:4.5},
+        {type:'cspike', x:4570},
+        {type:'spike', x:4790},
+        {type:'spike', x:5000}, {type:'spike', x:5040},
+        {type:'cspike', x:5260},
+        {type:'mover', x:5490, y:GROUND-220, w:28, h:28, dy:4.5},
+        {type:'spike', x:5530},
+        {type:'spike', x:5740}, {type:'spike', x:5780},
+        {type:'cspike', x:6000},
+        {type:'spike', x:6220},
+        {type:'spike', x:6430}, {type:'spike', x:6470},
+        {type:'cspike', x:6690},
+        {type:'spike', x:6870},
+        {type:'portal', x:7200, toMode:'plane'},
+        ...planeSection(7500, 16, 140, true),
+      ]
+    },
+    // LEVEL 10 — Flygläge 1 (sky)
+    {
+      length: 9000,
+      bgTop: '#87ceeb', bgBot: '#b0e0ff', groundColor: '#a8d8ea',
+      objects: [
+        // Portal direkt i starten — kub → plan
+        {type:'portal', x:250, toMode:'plane'},
+
+        // Planflygavsnitt — mjuk start, ökar gradvis
+        {type:'cspike', x:600},
+        {type:'spike',  x:900},
+        {type:'cspike', x:1150},
+        {type:'spike',  x:1400},
+        {type:'spike',  x:1650}, {type:'cspike', x:1650},
+        {type:'cspike', x:1950},
+        {type:'spike',  x:2200},
+        {type:'spike',  x:2450}, {type:'cspike', x:2450},
+        {type:'cspike', x:2700},
+        {type:'spike',  x:2950},
+        {type:'spike',  x:3200}, {type:'cspike', x:3200},
+        {type:'cspike', x:3450},
+        {type:'spike',  x:3700},
+        {type:'spike',  x:3950}, {type:'cspike', x:3950},
+        {type:'spike',  x:4200},
+        {type:'cspike', x:4450},
+        {type:'spike',  x:4700}, {type:'cspike', x:4700},
+        {type:'cspike', x:4950},
+        {type:'spike',  x:5200},
+        {type:'spike',  x:5450}, {type:'cspike', x:5450},
+        {type:'cspike', x:5700},
+        {type:'spike',  x:5950},
+
+        // Returportal — plan → kub
+        {type:'portal', x:6300, toMode:'cube'},
+
+        // Kubavsnitt på slutet
+        {type:'spike',  x:6700},
+        {type:'spike',  x:6920}, {type:'spike', x:6960},
+        {type:'cspike', x:7180},
+        {type:'spike',  x:7400}, {type:'spike', x:7440},
+        {type:'cspike', x:7660},
+        {type:'spike',  x:7880},
+        {type:'spike',  x:8100}, {type:'spike', x:8140},
+        {type:'cspike', x:8380},
+        {type:'spike',  x:8600},
+      ]
+    },
+  ];
+}
+
+// ── Game state ─────────────────────────────────────────────────────────
+let levels, currentLevel, state; // 'menu','playing','dead','win'
+let player, camera, objects, particles;
+let spaceDown = false, lastJumpTime = 0, jumpHeld = false;
+let attempts = 0;
+
+function initLevel(idx) {
+  currentLevel = idx;
+  levels = makeLevels();
+  const lvl = levels[idx];
+  player = { x: 100, y: GROUND - TILE, w: TILE, h: TILE, vy: 0, onGround: false, onPlatform: false, angle: 0, mode: 'cube' };
+  camera = { x: 0 };
+  particles = [];
+  // Instantiate objects with mover state
+  objects = lvl.objects.map(o => ({
+    ...o,
+    _y: o.y ?? 0,
+    _dir: 1,
+    _min: o.y ? o.y - 80 : 0,
+    _max: o.y ? o.y + 80 : 0,
+  }));
+  state = 'playing';
+  attempts++;
+  spaceDown = false;
+  lastJumpTime = 0;
+}
+
+// ── Input ──────────────────────────────────────────────────────────────
+document.addEventListener('keydown', e => {
+  if (e.code === 'Space') {
+    e.preventDefault();
+    if (AC.state === 'suspended') AC.resume();
+    if (!spaceDown) {
+      spaceDown = true;
+      tryJump();
+    }
+  }
+});
+document.addEventListener('keyup', e => {
+  if (e.code === 'Space') { spaceDown = false; lastJumpTime = 0; }
+});
+canvas.addEventListener('pointerdown', () => {
+  if (AC.state === 'suspended') AC.resume();
+  if (!spaceDown) { spaceDown = true; tryJump(); }
+});
+canvas.addEventListener('pointerup', () => { spaceDown = false; lastJumpTime = 0; });
+
+function tryJump() {
+  if (state !== 'playing') return;
+  if (player.mode === 'cube' && (player.onGround || player.onPlatform)) {
+    doJump();
+  }
+}
+
+function doJump() {
+  player.vy = JUMP_FORCE;
+  player.onGround = false;
+  player.onPlatform = false;
+  lastJumpTime = performance.now();
+  sfxJump();
+}
+
+// ── Geometry helpers ───────────────────────────────────────────────────
+function spikeVerts(x, y) {
+  // Ground spike: triangle pointing up, base on ground
+  return [{x: x, y: GROUND}, {x: x + TILE/2, y: GROUND - TILE}, {x: x + TILE, y: GROUND}];
+}
+function cspikeVerts(x) {
+  const top = 60;
+  return [{x: x, y: top}, {x: x + TILE/2, y: top + TILE}, {x: x + TILE, y: top}];
+}
+function playerVerts(p) {
+  const cx = p.x + p.w/2, cy = p.y + p.h/2;
+  const hw = p.w/2, hh = p.h/2;
+  const a = p.angle;
+  const cos = Math.cos(a), sin = Math.sin(a);
+  const corners = [[-hw,-hh],[hw,-hh],[hw,hh],[-hw,hh]];
+  return corners.map(([lx,ly]) => ({
+    x: cx + lx*cos - ly*sin,
+    y: cy + lx*sin + ly*cos,
+  }));
+}
+
+function pointInTriangle(px, py, v) {
+  function sign(p1x,p1y,p2x,p2y,p3x,p3y) {
+    return (p1x-p3x)*(p2y-p3y)-(p2x-p3x)*(p1y-p3y);
+  }
+  const d1=sign(px,py,v[0].x,v[0].y,v[1].x,v[1].y);
+  const d2=sign(px,py,v[1].x,v[1].y,v[2].x,v[2].y);
+  const d3=sign(px,py,v[2].x,v[2].y,v[0].x,v[0].y);
+  const hasNeg=(d1<0)||(d2<0)||(d3<0);
+  const hasPos=(d1>0)||(d2>0)||(d3>0);
+  return !(hasNeg&&hasPos);
+}
+
+function playerHitsSpike(p, verts) {
+  const pv = playerVerts(p);
+  return pv.some(pt => pointInTriangle(pt.x, pt.y, verts));
+}
+
+function playerHitsCspike(p, verts) {
+  const pv = playerVerts(p);
+  return pv.some(pt => pointInTriangle(pt.x, pt.y, verts));
+}
+
+function rectsOverlap(ax,ay,aw,ah, bx,by,bw,bh) {
+  return ax < bx+bw && ax+aw > bx && ay < by+bh && ay+ah > by;
+}
+
+// ── Particles ──────────────────────────────────────────────────────────
+function spawnParticles(x, y) {
+  for (let i = 0; i < 18; i++) {
+    const angle = Math.random() * Math.PI * 2;
+    const speed = 2 + Math.random() * 5;
+    particles.push({
+      x, y,
+      vx: Math.cos(angle)*speed,
+      vy: Math.sin(angle)*speed - 2,
+      life: 1, decay: 0.03 + Math.random()*0.03,
+      r: 4 + Math.random()*6,
+      color: ['#f5a623','#ff6b6b','#fff','#ffd166'][Math.floor(Math.random()*4)]
+    });
+  }
+}
+
+// ── Update ─────────────────────────────────────────────────────────────
+let lastTime = 0;
+function update(ts) {
+  if (state !== 'playing') return;
+  const dt = Math.min(ts - lastTime, 32);
+  lastTime = ts;
+
+  const lvl = levels[currentLevel];
+
+  if (player.mode === 'cube') {
+    // Auto-jump while holding space
+    if (spaceDown && (player.onGround || player.onPlatform)) {
+      const now = performance.now();
+      if (now - lastJumpTime > JUMP_INTERVAL) doJump();
+    }
+    player.vy += GRAVITY;
+    player.y += player.vy;
+    player.x += SPEED;
+    player.onGround = false;
+    player.onPlatform = false;
+    if (player.y + player.h >= GROUND) { player.y = GROUND - player.h; player.vy = 0; player.onGround = true; }
+    if (player.y <= 60) { player.y = 60; player.vy = Math.abs(player.vy); }
+    if (!player.onGround && !player.onPlatform) { player.angle += 0.08; }
+    else { player.angle = Math.round(player.angle / (Math.PI/2)) * (Math.PI/2); }
+  } else {
+    // Plane mode — space = thrust up
+    if (spaceDown) player.vy = Math.max(player.vy - THRUST, -MAX_VY_PLANE);
+    player.vy = Math.min(player.vy + GRAVITY_PLANE, MAX_VY_PLANE);
+    player.y += player.vy;
+    player.x += SPEED;
+    player.onGround = false;
+    player.onPlatform = false;
+    player.angle = Math.atan2(player.vy, SPEED) * 0.45;
+    if (player.y + player.h >= GROUND) { die(); return; }
+    if (player.y <= 60) { die(); return; }
+  }
+
+  // Camera
+  camera.x = player.x - W * 0.25;
+
+  // Update movers
+  for (const o of objects) {
+    if (o.type === 'mover') {
+      o._y += o.dy * o._dir;
+      if (o._y <= o._min || o._y >= o._max) o._dir *= -1;
+      o.y = o._y;
+    }
+  }
+
+  // Collision with objects
+  for (const o of objects) {
+    const ox = o.x;
+    if (o.type === 'portal') {
+      const pcx = player.x + player.w / 2;
+      if (pcx >= ox && pcx <= ox + 24 && o.toMode !== player.mode) {
+        player.mode = o.toMode;
+        player.vy = o.toMode === 'plane' ? -2 : 0;
+        player.angle = 0;
+        sfxPortal();
+      }
+      continue;
+    }
+    if (o.type === 'spike') {
+      const verts = spikeVerts(ox, GROUND);
+      if (playerHitsSpike(player, verts)) { die(); return; }
+    } else if (o.type === 'cspike') {
+      const verts = cspikeVerts(ox);
+      if (playerHitsCspike(player, verts)) { die(); return; }
+    } else if (o.type === 'platform') {
+      if (player.mode === 'cube' && rectsOverlap(player.x, player.y, player.w, player.h, ox, o.y, o.w, o.h)) {
+        const prevBottom = player.y + player.h - player.vy;
+        if (prevBottom <= o.y + 4 && player.vy >= 0) {
+          player.y = o.y - player.h; player.vy = 0; player.onPlatform = true;
+        } else { die(); return; }
+      }
+    } else if (o.type === 'mover') {
+      if (rectsOverlap(player.x, player.y, player.w, player.h, ox, o.y, o.w, o.h)) {
+        const prevBottom = player.y + player.h - player.vy;
+        if (prevBottom <= o.y + 6 && player.vy >= 0) {
+          player.y = o.y - player.h; player.vy = 0; player.onPlatform = true;
+        } else { die(); return; }
+      }
+    }
+  }
+
+  // Update particles
+  for (const p of particles) { p.x += p.vx; p.y += p.vy; p.vy += 0.15; p.life -= p.decay; }
+  particles = particles.filter(p => p.life > 0);
+
+  // Progress
+  const pct = Math.min(100, Math.floor((player.x / lvl.length) * 100));
+  progressBar.style.width = pct + '%';
+  percentEl.textContent = pct + '%';
+
+  // Win
+  if (player.x >= lvl.length) {
+    state = 'win';
+    sfxWin();
+    showOverlay('win');
+  }
+}
+
+function die() {
+  spawnParticles(player.x - camera.x + player.w/2, player.y + player.h/2);
+  sfxDeath();
+  state = 'dead';
+  setTimeout(() => { initLevel(currentLevel); }, 800);
+}
+
+// ── Draw ───────────────────────────────────────────────────────────────
+function draw(ts) {
+  if (state === 'menu') return;
+  const lvl = levels[currentLevel];
+
+  // Background gradient
+  const grad = ctx.createLinearGradient(0, 0, 0, H);
+  grad.addColorStop(0, lvl.bgTop);
+  grad.addColorStop(1, lvl.bgBot);
+  ctx.fillStyle = grad;
+  ctx.fillRect(0, 0, W, H);
+
+  // Stars
+  ctx.fillStyle = 'rgba(255,255,255,0.3)';
+  for (let i = 0; i < 60; i++) {
+    const sx = ((i * 137 + camera.x * 0.1) % W + W) % W;
+    const sy = (i * 73) % (H - 100);
+    ctx.fillRect(sx, sy, 1.5, 1.5);
+  }
+
+  ctx.save();
+  ctx.translate(-camera.x, 0);
+
+  // Ground
+  ctx.fillStyle = lvl.groundColor;
+  ctx.fillRect(camera.x, GROUND, W, H - GROUND);
+  // Ground line
+  ctx.fillStyle = 'rgba(255,255,255,0.1)';
+  ctx.fillRect(camera.x, GROUND, W, 3);
+
+  // Ceiling bar
+  ctx.fillStyle = 'rgba(255,255,255,0.08)';
+  ctx.fillRect(camera.x, 57, W, 3);
+
+  // Objects
+  for (const o of objects) {
+    const sx = o.x - camera.x;
+    if (sx < -100 || sx > W + 100) continue; // cull
+
+    if (o.type === 'spike') {
+      ctx.fillStyle = '#ff6b6b';
+      ctx.beginPath();
+      ctx.moveTo(o.x, GROUND);
+      ctx.lineTo(o.x + TILE/2, GROUND - TILE);
+      ctx.lineTo(o.x + TILE, GROUND);
+      ctx.closePath();
+      ctx.fill();
+      ctx.strokeStyle = '#ff4444';
+      ctx.lineWidth = 1.5;
+      ctx.stroke();
+    } else if (o.type === 'cspike') {
+      ctx.fillStyle = '#ff6b6b';
+      ctx.beginPath();
+      ctx.moveTo(o.x, 60);
+      ctx.lineTo(o.x + TILE/2, 60 + TILE);
+      ctx.lineTo(o.x + TILE, 60);
+      ctx.closePath();
+      ctx.fill();
+      ctx.strokeStyle = '#ff4444';
+      ctx.lineWidth = 1.5;
+      ctx.stroke();
+    } else if (o.type === 'platform') {
+      ctx.fillStyle = '#52b788';
+      ctx.fillRect(o.x, o.y, o.w, o.h);
+      ctx.fillStyle = '#74c69d';
+      ctx.fillRect(o.x, o.y, o.w, 4);
+    } else if (o.type === 'mover') {
+      ctx.fillStyle = '#e63946';
+      ctx.fillRect(o.x, o.y, o.w, o.h);
+      ctx.fillStyle = '#ff6b6b';
+      ctx.fillRect(o.x+2, o.y+2, o.w-4, 5);
+    } else if (o.type === 'portal') {
+      const pc = o.toMode === 'plane' ? '#00d4ff' : '#f5a623';
+      const t = Date.now() / 600;
+      ctx.save();
+      ctx.shadowColor = pc; ctx.shadowBlur = 18 + Math.sin(t)*6;
+      ctx.fillStyle = pc + '55';
+      ctx.fillRect(o.x, 60, 24, GROUND - 60);
+      ctx.fillStyle = pc;
+      ctx.fillRect(o.x, 60, 4, GROUND - 60);
+      ctx.fillRect(o.x + 20, 60, 4, GROUND - 60);
+      ctx.shadowBlur = 0;
+      ctx.fillStyle = '#fff';
+      ctx.font = 'bold 18px serif';
+      ctx.textAlign = 'center';
+      ctx.fillText(o.toMode === 'plane' ? '✈' : '◼', o.x + 12, GROUND/2 + 40);
+      ctx.textAlign = 'left';
+      ctx.restore();
+    }
+  }
+
+  // Player
+  if (state === 'playing') {
+    const cx = player.x + player.w/2, cy = player.y + player.h/2;
+    ctx.save();
+    ctx.translate(cx, cy);
+    ctx.rotate(player.angle);
+    if (player.mode === 'cube') {
+      ctx.shadowColor = '#f5a623'; ctx.shadowBlur = 15;
+      const hw = player.w/2, hh = player.h/2;
+      ctx.fillStyle = '#f5a623';
+      ctx.fillRect(-hw, -hh, player.w, player.h);
+      ctx.shadowBlur = 0;
+      ctx.fillStyle = '#fff3';
+      ctx.fillRect(-hw+5, -hh+5, player.w-10, player.h-10);
+      ctx.strokeStyle = '#ffd166'; ctx.lineWidth = 2;
+      ctx.strokeRect(-hw, -hh, player.w, player.h);
+    } else {
+      // Plane
+      ctx.shadowColor = '#00d4ff'; ctx.shadowBlur = 18;
+      ctx.fillStyle = '#00d4ff';
+      ctx.beginPath();
+      ctx.moveTo(22, 0);
+      ctx.lineTo(-14, -11);
+      ctx.lineTo(-8, 0);
+      ctx.lineTo(-14, 11);
+      ctx.closePath();
+      ctx.fill();
+      ctx.shadowBlur = 0;
+      ctx.fillStyle = '#ffffff88';
+      ctx.beginPath();
+      ctx.ellipse(7, 0, 7, 4, 0, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.fillStyle = '#00d4ff99';
+      ctx.beginPath();
+      ctx.moveTo(-8, 0); ctx.lineTo(-20, -5); ctx.lineTo(-16, 0); ctx.lineTo(-20, 5); ctx.closePath();
+      ctx.fill();
+    }
+    ctx.restore();
+  }
+
+  ctx.restore();
+
+  // Particles (screen space)
+  for (const p of particles) {
+    ctx.globalAlpha = p.life;
+    ctx.fillStyle = p.color;
+    ctx.beginPath();
+    ctx.arc(p.x + camera.x - camera.x, p.y, p.r * p.life, 0, Math.PI*2);
+    // Particles are already in screen space from spawnParticles
+    ctx.fill();
+  }
+  ctx.globalAlpha = 1;
+
+  // Attempts HUD
+  ctx.fillStyle = 'rgba(255,255,255,0.5)';
+  ctx.font = '14px Segoe UI';
+  ctx.fillText(`Försök: ${attempts}`, 12, H - 10);
+}
+
+// ── Draw particles in screen space fix ────────────────────────────────
+// (particles stored as screen coords, recalculate on spawn)
+const _origSpawn = spawnParticles;
+// Override so particles use screen space
+function spawnParticlesScreen(sx, sy) {
+  for (let i = 0; i < 18; i++) {
+    const angle = Math.random() * Math.PI * 2;
+    const speed = 2 + Math.random() * 5;
+    particles.push({
+      x: sx, y: sy,
+      vx: Math.cos(angle)*speed,
+      vy: Math.sin(angle)*speed - 2,
+      life: 1, decay: 0.03 + Math.random()*0.03,
+      r: 4 + Math.random()*6,
+      color: ['#f5a623','#ff6b6b','#fff','#ffd166'][Math.floor(Math.random()*4)]
+    });
+  }
+}
+
+// ── Override die to use screen coords ─────────────────────────────────
+function die() {
+  const sx = player.x - camera.x + player.w/2;
+  const sy = player.y + player.h/2;
+  spawnParticlesScreen(sx, sy);
+  sfxDeath();
+  state = 'dead';
+  setTimeout(() => { initLevel(currentLevel); }, 800);
+}
+
+// ── Overlay ────────────────────────────────────────────────────────────
+function showOverlay(type) {
+  overlay.innerHTML = '';
+  if (type === 'win') {
+    overlay.innerHTML = `
+      <h1 style="color:#74c69d;text-shadow:0 0 20px #74c69d;">KLAR!</h1>
+      <p class="subtitle" style="color:#fff;font-size:1.3rem;">Nivå ${currentLevel+1} klar!</p>
+      <p style="color:#aaa;">Försök: ${attempts}</p>
+      <div id="level-select">
+        ${levels.map((_,i) => `<button data-level="${i}" class="${i===currentLevel?'active':''}">Nivå ${i+1}</button>`).join('')}
+      </div>
+      <button id="startBtn">SPELA IGEN</button>
+    `;
+    overlay.style.display = 'flex';
+    bindOverlayButtons();
+  }
+}
+
+function bindOverlayButtons() {
+  document.getElementById('startBtn')?.addEventListener('click', () => {
+    overlay.style.display = 'none';
+    attempts = 0;
+    initLevel(currentLevel);
+  });
+  document.querySelectorAll('[data-level]').forEach(btn => {
+    btn.addEventListener('click', () => {
+      document.querySelectorAll('[data-level]').forEach(b => b.classList.remove('active'));
+      btn.classList.add('active');
+      currentLevel = parseInt(btn.dataset.level);
+    });
+  });
+}
+
+// ── Game loop ──────────────────────────────────────────────────────────
+function loop(ts) {
+  update(ts);
+  draw(ts);
+  requestAnimationFrame(loop);
+}
+
+// ── Init ───────────────────────────────────────────────────────────────
+levels = makeLevels();
+state = 'menu';
+currentLevel = 0;
+attempts = 0;
+
+// Initial draw of menu background
+(function drawMenuBg() {
+  const lvl = levels[0];
+  const grad = ctx.createLinearGradient(0, 0, 0, H);
+  grad.addColorStop(0, lvl.bgTop);
+  grad.addColorStop(1, lvl.bgBot);
+  ctx.fillStyle = grad;
+  ctx.fillRect(0, 0, W, H);
+})();
+
+bindOverlayButtons();
+
+document.getElementById('startBtn').addEventListener('click', () => {
+  overlay.style.display = 'none';
+  attempts = 0;
+  initLevel(currentLevel);
+  requestAnimationFrame(loop);
+}, { once: true });
+</script>
+</body>
+</html>
